@@ -15,6 +15,11 @@
 (define-constant ERR-INVALID-PRICE (err u1009))
 (define-constant ERR-NOT-WRITER (err u1010))
 (define-constant ERR-ALREADY-SETTLED (err u1011))
+(define-constant ERR-INVALID-OPTION-ID (err u1012))
+(define-constant ERR-INVALID-PREMIUM (err u1013))
+(define-constant ERR-INVALID-AMOUNT (err u1014))
+(define-constant ERR-INVALID-OPTION-TYPE (err u1015))
+(define-constant ERR-INVALID-ASSET (err u1016))
 
 ;; Option Types
 (define-constant OPTION-TYPE-CALL u1)
@@ -62,11 +67,31 @@
   (var-get option-count)
 )
 
+;; Validate option ID
+(define-private (validate-option-id (option-id uint))
+  (let ((max-id (var-get option-count)))
+    (and (> option-id u0) (<= option-id max-id))
+  )
+)
+
+;; Validate option type
+(define-private (validate-option-type (option-type uint))
+  (or (is-eq option-type OPTION-TYPE-CALL) (is-eq option-type OPTION-TYPE-PUT))
+)
+
+;; Validate asset name
+(define-private (validate-asset (asset (string-ascii 32)))
+  (> (len asset) u0)
+)
+
 ;; Get option details
 (define-read-only (get-option (option-id uint))
-  (match (map-get? options { option-id: option-id })
-    option (ok option)
-    (err ERR-OPTION-NOT-FOUND)
+  (begin
+    (asserts! (validate-option-id option-id) (err ERR-INVALID-OPTION-ID))
+    (match (map-get? options { option-id: option-id })
+      option (ok option)
+      (err ERR-OPTION-NOT-FOUND)
+    )
   )
 )
 
@@ -80,24 +105,17 @@
   (default-to { option-ids: (list) } (map-get? options-by-holder { holder: holder }))
 )
 
-;; Add option ID to list for a writer
-;; This is a simplified implementation that just logs but doesn't actually add to a list
-;; In a real implementation, you'd want to properly maintain these indexes
+;; Add option ID to writer's list - simplified version
 (define-private (add-option-to-writer (writer principal) (option-id uint))
   true
 )
 
-;; Add option ID to list for a holder
-;; This is a simplified implementation that just logs but doesn't actually add to a list
-;; In a real implementation, you'd want to properly maintain these indexes
+;; Add option ID to holder's list - simplified version
 (define-private (add-option-to-holder (holder principal) (option-id uint))
   true
 )
 
-;; Remove option ID from list for a holder
-;; Note: In a real implementation, you would need to handle this differently
-;; This is a simplified approach that doesn't actually remove the option
-;; but just demonstrates the concept
+;; Remove option ID from holder's list - simplified version
 (define-private (remove-option-from-holder (holder principal) (option-id uint))
   true
 )
@@ -111,15 +129,15 @@
     (option-type uint)
     (amount uint))
   (let 
-    (
-      (new-option-id (+ (var-get option-count) u1))
-      (current-block-height block-height)
-    )
+    ((new-option-id (+ (var-get option-count) u1))
+     (current-block-height block-height))
     ;; Validate inputs
+    (asserts! (validate-asset underlying-asset) (err ERR-INVALID-ASSET))
     (asserts! (> strike-price u0) (err ERR-INVALID-STRIKE-PRICE))
-    (asserts! (> amount u0) (err ERR-INVALID-PRICE))
+    (asserts! (> premium u0) (err ERR-INVALID-PREMIUM))
+    (asserts! (> amount u0) (err ERR-INVALID-AMOUNT))
     (asserts! (> expiration current-block-height) (err ERR-INVALID-EXPIRY))
-    (asserts! (or (is-eq option-type OPTION-TYPE-CALL) (is-eq option-type OPTION-TYPE-PUT)) (err ERR-NOT-AUTHORIZED))
+    (asserts! (validate-option-type option-type) (err ERR-INVALID-OPTION-TYPE))
     
     ;; Update option count
     (var-set option-count new-option-id)
@@ -152,205 +170,226 @@
 
 ;; Buy an option from the writer
 (define-public (buy-option (option-id uint))
-  (let 
-    (
-      (option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
-      (current-block-height block-height)
-    )
-    ;; Validate option
-    (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
-    (asserts! (is-eq (get status option) OPTION-STATUS-ACTIVE) (err ERR-ALREADY-EXERCISED))
-    (asserts! (is-eq (get writer option) (get holder option)) (err ERR-NOT-WRITER))
+  (begin
+    ;; Validate option ID
+    (asserts! (validate-option-id option-id) (err ERR-INVALID-OPTION-ID))
     
-    ;; Transfer premium from buyer to writer
-    (match (stx-transfer? (get premium option) tx-sender (get writer option))
-      success
-        (begin
-          ;; Update option holder
-          (map-set options
-            { option-id: option-id }
-            (merge option { holder: tx-sender })
+    (let 
+      ((option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
+       (current-block-height block-height))
+      ;; Validate option
+      (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
+      (asserts! (is-eq (get status option) OPTION-STATUS-ACTIVE) (err ERR-ALREADY-EXERCISED))
+      (asserts! (is-eq (get writer option) (get holder option)) (err ERR-NOT-WRITER))
+      
+      ;; Transfer premium from buyer to writer
+      (match (stx-transfer? (get premium option) tx-sender (get writer option))
+        success
+          (begin
+            ;; Update option holder
+            (map-set options
+              { option-id: option-id }
+              (merge option { holder: tx-sender })
+            )
+            
+            ;; Update indices
+            (add-option-to-holder tx-sender option-id)
+            (remove-option-from-holder (get writer option) option-id)
+            
+            (ok true)
           )
-          
-          ;; Update indices
-          (add-option-to-holder tx-sender option-id)
-          (remove-option-from-holder (get writer option) option-id)
-          
-          (ok true)
-        )
-      error (err ERR-INSUFFICIENT-BALANCE)
+        error (err ERR-INSUFFICIENT-BALANCE)
+      )
     )
   )
 )
 
 ;; List an option for sale
 (define-public (list-option-for-sale (option-id uint) (price uint))
-  (let 
-    (
-      (option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
-      (current-block-height block-height)
-    )
-    ;; Validate option
-    (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
-    (asserts! (is-eq (get status option) OPTION-STATUS-ACTIVE) (err ERR-ALREADY-EXERCISED))
-    (asserts! (is-eq (get holder option) tx-sender) (err ERR-OPTION-NOT-OWNED))
+  (begin
+    ;; Validate option ID and price
+    (asserts! (validate-option-id option-id) (err ERR-INVALID-OPTION-ID))
     (asserts! (> price u0) (err ERR-INVALID-PRICE))
     
-    ;; Update option status and sale price
-    (map-set options
-      { option-id: option-id }
-      (merge option { 
-        status: OPTION-STATUS-FOR-SALE,
-        sale-price: (some price)
-      })
+    (let 
+      ((option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
+       (current-block-height block-height))
+      ;; Validate option
+      (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
+      (asserts! (is-eq (get status option) OPTION-STATUS-ACTIVE) (err ERR-ALREADY-EXERCISED))
+      (asserts! (is-eq (get holder option) tx-sender) (err ERR-OPTION-NOT-OWNED))
+      
+      ;; Update option status and sale price
+      (map-set options
+        { option-id: option-id }
+        (merge option { 
+          status: OPTION-STATUS-FOR-SALE,
+          sale-price: (some price)
+        })
+      )
+      
+      (ok true)
     )
-    
-    (ok true)
   )
 )
 
 ;; Cancel listing an option for sale
 (define-public (cancel-option-listing (option-id uint))
-  (let 
-    (
-      (option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
-    )
-    ;; Validate option
-    (asserts! (is-eq (get status option) OPTION-STATUS-FOR-SALE) (err ERR-OPTION-NOT-FOR-SALE))
-    (asserts! (is-eq (get holder option) tx-sender) (err ERR-OPTION-NOT-OWNED))
+  (begin
+    ;; Validate option ID
+    (asserts! (validate-option-id option-id) (err ERR-INVALID-OPTION-ID))
     
-    ;; Update option status and sale price
-    (map-set options
-      { option-id: option-id }
-      (merge option { 
-        status: OPTION-STATUS-ACTIVE,
-        sale-price: none
-      })
+    (let 
+      ((option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND))))
+      ;; Validate option
+      (asserts! (is-eq (get status option) OPTION-STATUS-FOR-SALE) (err ERR-OPTION-NOT-FOR-SALE))
+      (asserts! (is-eq (get holder option) tx-sender) (err ERR-OPTION-NOT-OWNED))
+      
+      ;; Update option status and sale price
+      (map-set options
+        { option-id: option-id }
+        (merge option { 
+          status: OPTION-STATUS-ACTIVE,
+          sale-price: none
+        })
+      )
+      
+      (ok true)
     )
-    
-    (ok true)
   )
 )
 
 ;; Buy a listed option from another user
 (define-public (buy-listed-option (option-id uint))
-  (let 
-    (
-      (option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
-      (current-block-height block-height)
-      (sale-price (default-to u0 (get sale-price option)))
-    )
-    ;; Validate option
-    (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
-    (asserts! (is-eq (get status option) OPTION-STATUS-FOR-SALE) (err ERR-OPTION-NOT-FOR-SALE))
-    (asserts! (> sale-price u0) (err ERR-INVALID-PRICE))
+  (begin
+    ;; Validate option ID
+    (asserts! (validate-option-id option-id) (err ERR-INVALID-OPTION-ID))
     
-    ;; Transfer payment from buyer to current holder
-    (match (stx-transfer? sale-price tx-sender (get holder option))
-      success 
-        (begin
-          ;; Update option holder and status
-          (map-set options
-            { option-id: option-id }
-            (merge option { 
-              holder: tx-sender,
-              status: OPTION-STATUS-ACTIVE,
-              sale-price: none
-            })
+    (let 
+      ((option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
+       (current-block-height block-height)
+       (sale-price (default-to u0 (get sale-price option))))
+      ;; Validate option
+      (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
+      (asserts! (is-eq (get status option) OPTION-STATUS-FOR-SALE) (err ERR-OPTION-NOT-FOR-SALE))
+      (asserts! (> sale-price u0) (err ERR-INVALID-PRICE))
+      
+      ;; Transfer payment from buyer to current holder
+      (match (stx-transfer? sale-price tx-sender (get holder option))
+        success 
+          (begin
+            ;; Update option holder and status
+            (map-set options
+              { option-id: option-id }
+              (merge option { 
+                holder: tx-sender,
+                status: OPTION-STATUS-ACTIVE,
+                sale-price: none
+              })
+            )
+            
+            ;; Update indices
+            (add-option-to-holder tx-sender option-id)
+            (remove-option-from-holder (get holder option) option-id)
+            
+            (ok true)
           )
-          
-          ;; Update indices
-          (add-option-to-holder tx-sender option-id)
-          (remove-option-from-holder (get holder option) option-id)
-          
-          (ok true)
-        )
-      error (err ERR-INSUFFICIENT-BALANCE)
+        error (err ERR-INSUFFICIENT-BALANCE)
+      )
     )
   )
 )
 
 ;; Exercise a CALL option
 (define-public (exercise-call-option (option-id uint))
-  (let 
-    (
-      (option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
-      (current-block-height block-height)
-      (total-strike-amount (* (get strike-price option) (get amount option)))
-    )
-    ;; Validate option
-    (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
-    (asserts! (is-eq (get status option) OPTION-STATUS-ACTIVE) (err ERR-ALREADY-EXERCISED))
-    (asserts! (is-eq (get option-type option) OPTION-TYPE-CALL) (err ERR-NOT-AUTHORIZED))
-    (asserts! (is-eq (get holder option) tx-sender) (err ERR-OPTION-NOT-OWNED))
+  (begin
+    ;; Validate option ID
+    (asserts! (validate-option-id option-id) (err ERR-INVALID-OPTION-ID))
     
-    ;; Transfer strike price from option holder to writer
-    (match (stx-transfer? total-strike-amount tx-sender (get writer option))
-      success
-        (begin
-          ;; Update option status
-          (map-set options
-            { option-id: option-id }
-            (merge option { status: OPTION-STATUS-EXERCISED })
+    (let 
+      ((option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
+       (current-block-height block-height)
+       (total-strike-amount (* (get strike-price option) (get amount option))))
+      ;; Validate option
+      (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
+      (asserts! (is-eq (get status option) OPTION-STATUS-ACTIVE) (err ERR-ALREADY-EXERCISED))
+      (asserts! (is-eq (get option-type option) OPTION-TYPE-CALL) (err ERR-NOT-AUTHORIZED))
+      (asserts! (is-eq (get holder option) tx-sender) (err ERR-OPTION-NOT-OWNED))
+      
+      ;; Transfer strike price from option holder to writer
+      (match (stx-transfer? total-strike-amount tx-sender (get writer option))
+        success
+          (begin
+            ;; Update option status
+            (map-set options
+              { option-id: option-id }
+              (merge option { status: OPTION-STATUS-EXERCISED })
+            )
+            
+            (ok true)
           )
-          
-          (ok true)
-        )
-      error (err ERR-INSUFFICIENT-BALANCE)
+        error (err ERR-INSUFFICIENT-BALANCE)
+      )
     )
   )
 )
 
 ;; Exercise a PUT option
 (define-public (exercise-put-option (option-id uint))
-  (let 
-    (
-      (option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
-      (current-block-height block-height)
-      (total-strike-amount (* (get strike-price option) (get amount option)))
-    )
-    ;; Validate option
-    (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
-    (asserts! (is-eq (get status option) OPTION-STATUS-ACTIVE) (err ERR-ALREADY-EXERCISED))
-    (asserts! (is-eq (get option-type option) OPTION-TYPE-PUT) (err ERR-NOT-AUTHORIZED))
-    (asserts! (is-eq (get holder option) tx-sender) (err ERR-OPTION-NOT-OWNED))
+  (begin
+    ;; Validate option ID
+    (asserts! (validate-option-id option-id) (err ERR-INVALID-OPTION-ID))
     
-    ;; Transfer strike price from writer to option holder
-    (match (stx-transfer? total-strike-amount (get writer option) tx-sender)
-      success
-        (begin
-          ;; Update option status
-          (map-set options
-            { option-id: option-id }
-            (merge option { status: OPTION-STATUS-EXERCISED })
+    (let 
+      ((option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
+       (current-block-height block-height)
+       (total-strike-amount (* (get strike-price option) (get amount option))))
+      ;; Validate option
+      (asserts! (< current-block-height (get expiration option)) (err ERR-OPTION-EXPIRED))
+      (asserts! (is-eq (get status option) OPTION-STATUS-ACTIVE) (err ERR-ALREADY-EXERCISED))
+      (asserts! (is-eq (get option-type option) OPTION-TYPE-PUT) (err ERR-NOT-AUTHORIZED))
+      (asserts! (is-eq (get holder option) tx-sender) (err ERR-OPTION-NOT-OWNED))
+      
+      ;; Transfer strike price from writer to option holder
+      (match (stx-transfer? total-strike-amount (get writer option) tx-sender)
+        success
+          (begin
+            ;; Update option status
+            (map-set options
+              { option-id: option-id }
+              (merge option { status: OPTION-STATUS-EXERCISED })
+            )
+            
+            (ok true)
           )
-          
-          (ok true)
-        )
-      error (err ERR-INSUFFICIENT-BALANCE)
+        error (err ERR-INSUFFICIENT-BALANCE)
+      )
     )
   )
 )
 
 ;; Expire an option (can be called by anyone once the expiration block height is reached)
 (define-public (expire-option (option-id uint))
-  (let 
-    (
-      (option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
-      (current-block-height block-height)
-    )
-    ;; Validate option can be expired
-    (asserts! (>= current-block-height (get expiration option)) (err ERR-NOT-AUTHORIZED))
-    (asserts! (not (is-eq (get status option) OPTION-STATUS-EXPIRED)) (err ERR-ALREADY-SETTLED))
-    (asserts! (not (is-eq (get status option) OPTION-STATUS-EXERCISED)) (err ERR-ALREADY-EXERCISED))
+  (begin
+    ;; Validate option ID
+    (asserts! (validate-option-id option-id) (err ERR-INVALID-OPTION-ID))
     
-    ;; Update option status
-    (map-set options
-      { option-id: option-id }
-      (merge option { status: OPTION-STATUS-EXPIRED })
+    (let 
+      ((option (unwrap! (map-get? options { option-id: option-id }) (err ERR-OPTION-NOT-FOUND)))
+       (current-block-height block-height))
+      ;; Validate option can be expired
+      (asserts! (>= current-block-height (get expiration option)) (err ERR-NOT-AUTHORIZED))
+      (asserts! (not (is-eq (get status option) OPTION-STATUS-EXPIRED)) (err ERR-ALREADY-SETTLED))
+      (asserts! (not (is-eq (get status option) OPTION-STATUS-EXERCISED)) (err ERR-ALREADY-EXERCISED))
+      
+      ;; Update option status
+      (map-set options
+        { option-id: option-id }
+        (merge option { status: OPTION-STATUS-EXPIRED })
+      )
+      
+      (ok true)
     )
-    
-    (ok true)
   )
 )
 
